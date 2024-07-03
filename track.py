@@ -1,0 +1,465 @@
+# limit the number of cpus used by high performance libraries
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import sys
+sys.path.insert(0, './yolov5')
+
+import math
+
+import argparse
+import os
+import platform
+import shutil
+import time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import cv2
+import torch
+import torch.backends.cudnn as cudnn
+
+from yolov5.models.experimental import attempt_load
+from yolov5.utils.downloads import attempt_download
+from yolov5.models.common import DetectMultiBackend
+from yolov5.utils.datasets import LoadImages, LoadStreams, VID_FORMATS
+from yolov5.utils.general import (LOGGER, check_img_size, non_max_suppression, scale_coords,
+                                  check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr)
+from yolov5.utils.torch_utils import select_device, time_sync
+from yolov5.utils.plots import Annotator, colors, save_one_box
+from deep_sort.utils.parser import get_config
+from deep_sort.deep_sort import DeepSort
+
+from collections import deque
+
+palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
+
+pts = [deque(maxlen=30) for _ in range(9999)]
+
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[0]  # yolov5 deepsort root directory
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # add ROOT to PATH
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+
+def compute_color_for_labels(label):
+    """
+    Simple function that adds fixed color depending on the class
+    """
+    color = [int((p * (label ** 2 - label + 1)) % 255) for p in palette]
+    return tuple(color)
+
+#Your video/image resolution/size
+#画面分辨率
+W = 1280
+H = 720
+
+excel_path = r'./camera_parameters.xlsx'
+
+def camera_parameters(excel_path):
+    # Load Intrinsics matrix of Camera
+    df_intrinsic = pd.read_excel(excel_path, sheet_name='内参矩阵', header=None)
+    # Load Extrinsics matrix of Camera
+    df_p = pd.read_excel(excel_path, sheet_name='外参矩阵', header=None)
+
+    print('外参矩阵形状 intrinsics matrix shape：', df_p.values.shape)
+    print('内参矩阵形状 Extrinsics matrix shape：', df_intrinsic.values.shape)
+
+    return df_p.values, df_intrinsic.values
+
+def object_point_world_position(u, v, w, h, p, k):
+    u1 = u
+    v1 = v + h / 2
+    #point (x,y) in image coordinate position
+    print('图像坐标系image_coordinate_position', u1, v1)
+
+    #alpha = -(90 + 0) / (2 * math.pi)
+    #peta = 0
+    #gama = -90 / (2 * math.pi)
+
+    fx = k[0, 0]
+    fy = k[1, 1]
+
+    #vertical height(m) from camera to the ground/road
+    #相机高度
+    Height = 0.5
+
+    #The angle between the camera len and the horizontal line(the moving direction of vehicle), default is 0
+    #相机与水平线夹角, 默认为0 相机镜头正对前方，无倾斜
+    angle_a = 0
+    angle_b = math.atan((v1 - H / 2) / fy)
+    angle_c = angle_b + angle_a
+    print('angle_b', angle_b)
+
+    depth = (Height / np.sin(angle_c)) * math.cos(angle_b)
+    print('depth', depth)
+
+    print('k', k)
+    print('p', p)
+
+    k_inv = np.linalg.inv(k)
+    p_inv = np.linalg.inv(p)
+
+    point_c = np.array([u1, v1, 1])
+    point_c = np.transpose(point_c)
+    print('point_c', point_c)
+    print('k_inv', k_inv)
+    print('p_inv', p_inv)
+
+    #point (x,y) in camera coordinate position
+    c_position = np.matmul(k_inv, depth * point_c)
+    print('相机坐标系camera_coordinate_position', c_position)
+
+    #point (x,y) in world coordinate position
+    c_position = np.append(c_position, 1)
+    c_position = np.transpose(c_position)
+    c_position = np.matmul(p_inv, c_position)
+    print('世界坐标系world_coordinate_position', c_position)
+    d1 = np.array((c_position[0], c_position[1]), dtype=float)
+
+    return d1
+
+def distance_func(kuang, xw=5, yw=0.1):
+    print('\n','=' * 50)
+    print('开始测距 Begin Ranging')
+    #fig = go.Figure()
+
+    #p=Extrinsics matrix, k=Intrinsics matrix
+    #p外参矩阵, k内参矩阵
+    p, k = camera_parameters(excel_path)
+    if len(kuang):
+        obj_position = []
+        #u, v, w, h = kuang[1] * W, kuang[2] * H, kuang[3] * W, kuang[4] * H
+        u, v, w, h = kuang[1], kuang[2], kuang[3], kuang[4]
+
+        #u,v=center point(x,y) w,h=box width/height
+        #u,v中心点坐标 w,h框宽和框高
+        print('中心点 center point(x,y)', u, v)
+        print('框宽/高 box width/height', w, h)
+        d1 = object_point_world_position(u, v, w, h, p, k)
+    distance = 0
+    print('距离 Distance', d1)
+    if d1[0] <= 0:
+        d1[:] = 0
+    else:
+        distance = math.sqrt(math.pow(d1[0], 2) + math.pow(d1[1], 2))
+
+    return distance, d1
+
+def detect(opt):
+    out, source, yolo_model, deep_sort_model, show_vid, save_vid, save_txt, save_csv, imgsz, evaluate, half, \
+        project, exist_ok, update, save_crop = \
+        opt.output, opt.source, opt.yolo_model, opt.deep_sort_model, opt.show_vid, opt.save_vid, \
+        opt.save_txt, opt.save_csv, opt.imgsz, opt.evaluate, opt.half, opt.project, opt.exist_ok, opt.update, opt.save_crop
+    webcam = source == '0' or source.startswith(
+        'rtsp') or source.startswith('http') or source.endswith('.txt')
+
+    # Initialize
+    device = select_device(opt.device)
+    half &= device.type != 'cpu'  # half precision only supported on CUDA
+
+    # The MOT16 evaluation runs multiple inference streams in parallel, each one writing to
+    # its own .txt file. Hence, in that case, the output folder is not restored
+    if not evaluate:
+        if os.path.exists(out):
+            pass
+            shutil.rmtree(out)  # delete output folder
+        os.makedirs(out)  # make new output folder
+
+    # Directories
+    if type(yolo_model) is str:  # single yolo model
+        exp_name = yolo_model.split(".")[0]
+    elif type(yolo_model) is list and len(yolo_model) == 1:  # single models after --yolo_model
+        exp_name = yolo_model[0].split(".")[0]
+    else:  # multiple models after --yolo_model
+        exp_name = "ensemble"
+    exp_name = exp_name + "_" + deep_sort_model.split('/')[-1].split('.')[0]
+    save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # increment run if project name exists
+    (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+
+    # Load model
+    model = DetectMultiBackend(yolo_model, device=device, dnn=opt.dnn)
+    stride, names, pt = model.stride, model.names, model.pt
+    imgsz = check_img_size(imgsz, s=stride)  # check image size
+
+    # Half
+    half &= pt and device.type != 'cpu'  # half precision only supported by PyTorch on CUDA
+    if pt:
+        model.model.half() if half else model.model.float()
+
+    # Set Dataloader
+    vid_path, vid_writer = None, None
+    # Check if environment supports image displays
+    if show_vid:
+        show_vid = check_imshow()
+
+    # Dataloader
+    if webcam:
+        show_vid = check_imshow()
+        cudnn.benchmark = True  # set True to speed up constant image size inference
+        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt)
+        nr_sources = len(dataset)
+    else:
+        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt)
+        nr_sources = 1
+    vid_path, vid_writer, txt_path = [None] * nr_sources, [None] * nr_sources, [None] * nr_sources
+
+    # initialize deepsort
+    cfg = get_config()
+    cfg.merge_from_file(opt.config_deepsort)
+
+    # Create as many trackers as there are video sources
+    deepsort_list = []
+    for i in range(nr_sources):
+        deepsort_list.append(
+            DeepSort(
+                deep_sort_model,
+                device,
+                max_dist=cfg.DEEPSORT.MAX_DIST,
+                max_iou_distance=cfg.DEEPSORT.MAX_IOU_DISTANCE,
+                max_age=cfg.DEEPSORT.MAX_AGE, n_init=cfg.DEEPSORT.N_INIT, nn_budget=cfg.DEEPSORT.NN_BUDGET,
+            )
+        )
+    outputs = [None] * nr_sources
+
+    # Get names and colors
+    names = model.module.names if hasattr(model, 'module') else model.names
+
+    # Run tracking
+    model.warmup(imgsz=(1 if pt else nr_sources, 3, *imgsz))  # warmup
+    dt, seen = [0.0, 0.0, 0.0, 0.0], 0
+
+    storage = []
+    distance_list = pd.DataFrame()
+    outputs_list = pd.DataFrame()
+
+    name_str=''
+
+    for frame_idx, (path, im, im0s, vid_cap, s) in enumerate(dataset):
+        print('frame_idx',frame_idx)
+        name_str=path.split('\\')[-1].split('.')[0]
+
+        t1 = time_sync()
+        im = torch.from_numpy(im).to(device)
+        im = im.half() if half else im.float()  # uint8 to fp16/32
+        im /= 255.0  # 0 - 255 to 0.0 - 1.0
+        if len(im.shape) == 3:
+            im = im[None]  # expand for batch dim
+        t2 = time_sync()
+        dt[0] += t2 - t1
+
+        # Inference
+        visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if opt.visualize else False
+        pred = model(im, augment=opt.augment, visualize=visualize)
+        t3 = time_sync()
+        dt[1] += t3 - t2
+
+        # Apply NMS
+        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms, max_det=opt.max_det)
+        dt[2] += time_sync() - t3
+
+        # Process detections
+        for i, det in enumerate(pred):  # detections per image
+            print('i:::::::::',i)
+            seen += 1
+            if webcam:  # nr_sources >= 1
+                p, im0, _ = path[i], im0s[i].copy(), dataset.count
+                p = Path(p)  # to Path
+                s += f'{i}: '
+                txt_file_name = p.name
+                save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
+            else:
+                p, im0, _ = path, im0s.copy(), getattr(dataset, 'frame', 0)
+                p = Path(p)  # to Path
+                # video file
+                if source.endswith(VID_FORMATS):
+                    txt_file_name = p.stem
+                    save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
+                # folder with imgs
+                else:
+                    txt_file_name = p.parent.name  # get folder name containing current img
+                    save_path = str(save_dir / p.parent.name)  # im.jpg, vid.mp4, ...
+
+            txt_path = str(save_dir / 'tracks' / txt_file_name)  # im.txt
+            s += '%gx%g ' % im.shape[2:]  # print string
+            imc = im0.copy() if save_crop else im0  # for save_crop
+
+            annotator = Annotator(im0, line_width=2, pil=not ascii)
+
+            if det is not None and len(det):
+                # Rescale boxes from img_size to im0 size
+                #det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
+                det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape)
+                #print(det[:, :4])
+
+                # Print results
+                for c in det[:, -1].unique():
+                    if not names[int(c)] in ['person', 'car', 'truck', 'bicycle', 'motorcycle', 'bus']:
+                        continue
+                    n = (det[:, -1] == c).sum()  # detections per class
+                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+
+                xywhs = xyxy2xywh(det[:, 0:4])
+                confs = det[:, 4]
+                clss = det[:, 5]
+
+                # pass detections to deepsort
+                t4 = time_sync()
+                outputs[i] = deepsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
+                t5 = time_sync()
+                dt[3] += t5 - t4
+
+                outputs_list=outputs_list.append([[frame_idx,outputs[0]]])
+
+                # draw boxes for visualization
+                distance_temp=[]
+                if len(outputs[i]) > 0:
+                    for j, (output, conf) in enumerate(zip(outputs[i], confs)):
+
+                        cls = output[5]
+
+                        if not names[int(cls)] in ['person', 'car', 'truck', 'bicycle', 'motorcycle', 'bus']:
+                            continue
+
+                        bboxes = output[0:4]
+                        points_list=[[output[0],output[1]],[output[2],output[3]],[output[2],output[1]],[output[0],output[3]]]
+
+                        id = output[4]
+
+                        pre_width=-999
+                        pre_frame=-999
+                        if len(outputs_list)>0:
+                            for ind in range(frame_idx-1,-1,-1):
+                                if len(outputs_list[outputs_list[0]==ind])!=0:
+                                    # [[1,2,3]]->[1,2,3]
+                                    temp_outputs_list=outputs_list[outputs_list[0]==ind][1].to_list()[0]
+                                    for output_item in temp_outputs_list:
+                                        if len(output_item)>0:
+                                            print('output',output_item)
+                                            if output_item[4]==id:
+                                                pre_width=abs(output_item[2]-output_item[0])
+                                                pre_frame=ind
+                                                break
+                                    if pre_width!=-999:
+                                        break
+                        print('pre_frame:',pre_frame)
+
+                        thickness=2
+                        color=compute_color_for_labels(id)
+                        center=(int((output[0]+output[2])/2),int((output[1]+output[3])/2))
+                        pts[id].append(center)
+
+                        center_bottom=(int(output[0]+abs(output[2]-output[0])/2),int(output[1]+abs(output[3]-output[1])))
+
+                        kuang = [cls, (output[0]+output[2])/2, (output[1]+output[3])/2, abs(output[2]-output[0]), abs(output[3]-output[1])]
+                        distance, d = distance_func(kuang)
+
+                        if d[0]>0:
+                            print('d',d)
+                            distance_temp.append([id,d[0]])
+
+                        pre_distance=-999
+                        if len(distance_list)>0 and pre_frame!=-999:
+                            #print(distance_list)
+                            print('pre_frame',pre_frame)
+                            #if (len(distance_list)-1)>=pre_frame:
+                            if len(distance_list[distance_list[0]==pre_frame])!=0:
+                                temp_distance_list=distance_list[distance_list[0]==pre_frame][1].to_list()[0]
+                                for distance_item in temp_distance_list:
+                                    if len(distance_item)>0:
+                                        if distance_item[0]==id:
+                                            pre_distance=distance_item[1]
+                                            break
+
+                        velocity=-999
+                        ttc=-999
+                        if pre_width!=-999 and pre_distance!=-999:
+
+                            # Speed calculation
+                            #速度计算
+                            velocity=(((abs(output[2]-output[0])-pre_width)/abs(output[2]-output[0]))*pre_distance)/((frame_idx-pre_frame)/20)
+                            if d[0]>0 and velocity!=0:
+                                ttc=d[0]/velocity
+
+                        if save_txt:
+                            # to MOT format
+                            bbox_left = output[0]
+                            bbox_top = output[1]
+                            bbox_w = output[2] - output[0]
+                            bbox_h = output[3] - output[1]
+                            # Write MOT compliant results to file
+
+                            with open(txt_path + '.txt', 'a') as f:
+                                f.write(('%g ' * 10 + '\n') % (frame_idx + 1, id, bbox_left,  # MOT format
+                                                               bbox_top, bbox_w, bbox_h, -1, -1, -1, i))
+
+                        if save_csv:
+                            storage.append([name_str, frame_idx+1, id, names[int(cls)], output[0], output[1], distance, d[0], d[1], output[2] - output[0], output[3] - output[1], velocity, ttc])
+
+                        if save_vid or save_crop or show_vid:  # Add bbox to image
+                            c = int(cls)  # integer class
+                            label = f'{id} {names[c]} {conf:.2f} {d[0]:.2f}m {velocity:.2f}m/s'
+                            #draw_boxes(im0, bboxes, id)
+
+                            cv2.circle(im0,(center),1,color,thickness)
+
+                            cv2.circle(im0,(center_bottom),1,color,thickness*2)
+
+                            for j in range(1,len(pts[id])):
+                                if pts[id][j-1] is None or pts[id][j] is None:
+                                    continue
+                                cv2.line(im0,(pts[id][j-1]),(pts[id][j]),(color),thickness)
+
+                            annotator.box_label(bboxes, label, color=colors(c, True))
+                            if save_crop:
+                                txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
+                                save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
+
+                distance_list=distance_list.append([[frame_idx,distance_temp]])
+                LOGGER.info(f'{s}Done. YOLO:({t3 - t2:.3f}s), DeepSort:({t5 - t4:.3f}s)')
+
+            else:
+                deepsort_list[i].increment_ages()
+                LOGGER.info('No detections')
+
+            # Stream results
+            im0 = annotator.result()
+            if show_vid:
+                cv2.imshow(str(p), im0)
+                cv2.waitKey(1)  # 1 millisecond
+
+            # Save results (image with detections)
+            if save_vid:
+                if vid_path[i] != save_path:  # new video
+                    vid_path[i] = save_path
+                    if isinstance(vid_writer[i], cv2.VideoWriter):
+                        vid_writer[i].release()  # release previous video writer
+                    if vid_cap:  # video
+                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    else:  # stream
+                        fps, w, h = 30, im0.shape[1], im0.shape[0]
+                    save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
+                    vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                vid_writer[i].write(im0)
+
+    # Print results
+    t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
+    LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS, %.1fms deep sort update \
+        per image at shape {(1, 3, *imgsz)}' % t)
+
+    # Modify the output path Here
+    if save_csv:
+        df = pd.DataFrame(storage)
+        df.to_excel('Your_path/test.xlsx',index=False)
+
+    if save_txt or save_vid:
+        s = f"\n{len(list(save_dir.glob('tracks/*.txt')))} tracks saved to {save_dir / 'tracks'}" if save_txt else ''
+        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
+    if update:
+        strip_optimizer(yolo_model)  # update model (to fix SourceChangeWarning)
